@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { Lock, Unlock, CloudRain, Sun, Flame, MapPin, Navigation, RefreshCw } from 'lucide-react';
+import { Lock, Unlock, CloudRain, Sun, RefreshCw } from 'lucide-react';
 
 interface ActivityItem {
   id: string;
@@ -166,6 +166,7 @@ export default function Timeline({
                             : 'bg-slate-900 border-slate-800 text-slate-500 hover:text-slate-400'
                         }`}
                         title={act.isLocked ? 'Unlock Slot' : 'Lock to this Time Slot'}
+                        aria-label={act.isLocked ? `Unlock ${act.poi.name}` : `Lock ${act.poi.name} to this time slot`}
                       >
                         {act.isLocked ? <Lock className="w-3.5 h-3.5" /> : <Unlock className="w-3.5 h-3.5" />}
                       </button>

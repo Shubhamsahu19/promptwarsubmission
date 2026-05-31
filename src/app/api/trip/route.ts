@@ -5,7 +5,12 @@ import { fetchPOIs, getWeatherForecast, ItineraryOptimizer } from '@/lib/optimiz
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
     const {
       title,
       destinationName,
@@ -22,8 +27,51 @@ export async function POST(req: Request) {
       accessibilityRequired = false,
     } = body;
 
-    if (!title || !destinationName || !lat || !lng || !startDate || !endDate) {
-      return NextResponse.json({ error: 'Missing required parameters' }, { status: 400 });
+    // Strict Input Validations
+    if (!title || typeof title !== 'string' || title.trim().length === 0 || title.length > 100) {
+      return NextResponse.json({ error: 'Invalid or missing title (max 100 chars)' }, { status: 400 });
+    }
+    if (!destinationName || typeof destinationName !== 'string' || destinationName.trim().length === 0 || destinationName.length > 100) {
+      return NextResponse.json({ error: 'Invalid or missing destination name (max 100 chars)' }, { status: 400 });
+    }
+    if (typeof lat !== 'number' || lat < -90 || lat > 90) {
+      return NextResponse.json({ error: 'Latitude must be a valid number between -90 and 90' }, { status: 400 });
+    }
+    if (typeof lng !== 'number' || lng < -180 || lng > 180) {
+      return NextResponse.json({ error: 'Longitude must be a valid number between -180 and 180' }, { status: 400 });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return NextResponse.json({ error: 'Invalid start or end date format' }, { status: 400 });
+    }
+    if (start > end) {
+      return NextResponse.json({ error: 'Start date must be before or equal to end date' }, { status: 400 });
+    }
+    const daysCount = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1);
+    if (daysCount > 30) {
+      return NextResponse.json({ error: 'Trip duration cannot exceed 30 days for optimization scaling constraints' }, { status: 400 });
+    }
+
+    if (budgetLimit !== undefined && budgetLimit !== null && (typeof budgetLimit !== 'number' || budgetLimit < 0)) {
+      return NextResponse.json({ error: 'Budget limit must be a positive number' }, { status: 400 });
+    }
+    if (typeof maxWalkingDistanceMeters !== 'number' || maxWalkingDistanceMeters < 500 || maxWalkingDistanceMeters > 50000) {
+      return NextResponse.json({ error: 'Max daily walking distance must be between 500m and 50km' }, { status: 400 });
+    }
+    if (typeof startTimeMinutes !== 'number' || startTimeMinutes < 0 || startTimeMinutes > 1440) {
+      return NextResponse.json({ error: 'Start time must be between 0 and 1440 minutes' }, { status: 400 });
+    }
+    if (typeof endTimeMinutes !== 'number' || endTimeMinutes < 0 || endTimeMinutes > 1440 || endTimeMinutes <= startTimeMinutes) {
+      return NextResponse.json({ error: 'End time must be after start time' }, { status: 400 });
+    }
+    if (!['foot', 'car', 'bike'].includes(transportMode)) {
+      return NextResponse.json({ error: 'Invalid transport mode' }, { status: 400 });
+    }
+    if (!Array.isArray(preferredTags) || preferredTags.length > 20 ||
+        !preferredTags.every((t: unknown) => typeof t === 'string' && t.length <= 40)) {
+      return NextResponse.json({ error: 'preferredTags must be an array of up to 20 short strings' }, { status: 400 });
     }
 
     const tripId = crypto.randomUUID();
@@ -83,10 +131,9 @@ export async function POST(req: Request) {
     savePOIsTx();
 
     // 4. Fetch Weather Forecast for trip range
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    const daysCount = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1);
-    const forecast = await getWeatherForecast(lat, lng, daysCount);
+    // (start, end, and daysCount were already computed and validated above)
+    // Pass the trip start date so the forecast aligns with the actual trip days.
+    const forecast = await getWeatherForecast(lat, lng, daysCount, startDate);
 
     // 5. Create Itinerary
     const itineraryId = crypto.randomUUID();
@@ -173,6 +220,6 @@ export async function POST(req: Request) {
     return NextResponse.json({ tripId, itineraryId }, { status: 201 });
   } catch (error: any) {
     console.error('Error creating trip:', error);
-    return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

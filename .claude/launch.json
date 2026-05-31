@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "promptwar",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeExecutable": "/opt/homebrew/opt/node@22/bin/node",
+      "runtimeArgs": ["node_modules/next/dist/bin/next", "start"],
       "port": 3000
     }
   ]

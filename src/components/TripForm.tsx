@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Compass, Loader2, Navigation, DollarSign, Calendar, Tag } from 'lucide-react';
+import { Compass, Loader2, Navigation, DollarSign, Tag } from 'lucide-react';
 
 interface TripFormProps {
   onSubmit: (tripData: any) => Promise<void>;
@@ -38,12 +38,11 @@ export default function TripForm({ onSubmit, isLoading }: TripFormProps) {
 
     setResolvingCity(true);
     try {
-      // Free geocoding using OSM Nominatim API
+      // Geocoding request hitting local database-backed cache proxy first
       const response = await fetch(
-        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(destination)}&format=json&limit=1`,
-        { headers: { 'User-Agent': 'TravelPlanningEngineDemo/1.0' } }
+        `/api/geocoding?q=${encodeURIComponent(destination)}`
       );
-      if (!response.ok) throw new Error('Geocoding service unavailable');
+      if (!response.ok) throw new Error('Geocoding service returned an error');
       const data = await response.json();
       
       if (!data || data.length === 0) {

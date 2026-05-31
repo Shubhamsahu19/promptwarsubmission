@@ -1,13 +1,17 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 
-let db: Database.Database;
-
 // For development hot-reloading, preserve the database connection across compilation cycles
 const globalObject = globalThis as unknown as { dbInstance: Database.Database };
 
 if (!globalObject.dbInstance) {
-  const dbPath = path.resolve(process.cwd(), 'travel_planner.db');
+  // Allow the DB location to be overridden for deployment (e.g. a mounted
+  // persistent volume). NOTE: file-based SQLite needs a stable, writable,
+  // POSIX filesystem — it is not suitable for serverless/ephemeral targets;
+  // use a managed/networked DB there instead.
+  const dbPath = process.env.DATABASE_PATH
+    ? path.resolve(process.env.DATABASE_PATH)
+    : path.resolve(process.cwd(), 'travel_planner.db');
   globalObject.dbInstance = new Database(dbPath);
   
   // Enable foreign keys and WAL mode for high performance concurrency
@@ -18,7 +22,7 @@ if (!globalObject.dbInstance) {
   initSchema(globalObject.dbInstance);
 }
 
-db = globalObject.dbInstance;
+const db = globalObject.dbInstance;
 
 function initSchema(database: Database.Database) {
   database.exec(`
@@ -100,6 +104,14 @@ function initSchema(database: Database.Database) {
       resolved INTEGER DEFAULT 0 NOT NULL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
       FOREIGN KEY (trip_id) REFERENCES trips(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS geocoding_cache (
+      query TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      lat REAL NOT NULL,
+      lng REAL NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
     );
   `);
 }

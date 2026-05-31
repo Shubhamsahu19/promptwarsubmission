@@ -1,5 +1,3 @@
-import { db } from './db';
-
 export interface Activity {
   id: string;
   name: string;
@@ -52,8 +50,24 @@ const AVERAGE_SPEEDS = {
   car: 600, // 36 km/h
 };
 
-// Caches route matrices in DB/memory to avoid rate-limiting
+// Caches route matrices in memory to avoid rate-limiting. Bounded with a
+// simple FIFO eviction so a long-running server cannot leak memory unbounded.
 const routeCache = new Map<string, { distance: number; duration: number; geometry?: any }>();
+const ROUTE_CACHE_MAX_ENTRIES = 5000;
+
+function cacheRoute(key: string, value: { distance: number; duration: number; geometry?: any }) {
+  if (routeCache.size >= ROUTE_CACHE_MAX_ENTRIES) {
+    // Evict the oldest entry (Map preserves insertion order).
+    const oldest = routeCache.keys().next().value;
+    if (oldest !== undefined) routeCache.delete(oldest);
+  }
+  routeCache.set(key, value);
+}
+
+// Circuit breaker state
+let osrmOfflineState = false;
+let lastOsrmAttemptTime = 0;
+const OSRM_RECOVERY_COOLDOWN_MS = 60000; // 1 minute cooldown
 
 export async function getRoute(
   from: { lat: number; lng: number },
@@ -66,55 +80,82 @@ export async function getRoute(
   }
 
   const osrmMode = mode === 'car' ? 'driving' : mode === 'bike' ? 'cycling' : 'walking';
-  const url = `https://router.project-osrm.org/route/v1/${osrmMode}/${from.lng},from.lat;${to.lng},${to.lat}?overview=full&geometries=geojson`;
+  const url = `https://router.project-osrm.org/route/v1/${osrmMode}/${from.lng},${from.lat};${to.lng},${to.lat}?overview=full&geometries=geojson`;
 
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
-    if (!res.ok) throw new Error('OSRM error');
-    const data = await res.json();
-    if (data.routes && data.routes.length > 0) {
-      const route = data.routes[0];
-      const result = {
-        distance: route.distance, // meters
-        duration: route.duration / 60, // minutes
-        geometry: route.geometry, // GeoJSON
-      };
-      routeCache.set(cacheKey, result);
-      return result;
+  const now = Date.now();
+  const shouldAttemptOsrm = !osrmOfflineState || (now - lastOsrmAttemptTime > OSRM_RECOVERY_COOLDOWN_MS);
+
+  if (shouldAttemptOsrm) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (!res.ok) throw new Error('OSRM error status ' + res.status);
+      const data = await res.json();
+      if (data.routes && data.routes.length > 0) {
+        const route = data.routes[0];
+        const result = {
+          distance: route.distance, // meters
+          duration: route.duration / 60, // minutes
+          geometry: route.geometry, // GeoJSON
+        };
+        if (osrmOfflineState) {
+          console.log('OSRM circuit breaker reset: server recovered.');
+          osrmOfflineState = false;
+        }
+        cacheRoute(cacheKey, result);
+        return result;
+      }
+    } catch (e) {
+      console.warn('OSRM request failed, tripping circuit breaker.', e instanceof Error ? e.message : e);
+      osrmOfflineState = true;
+      lastOsrmAttemptTime = now;
     }
-  } catch (e) {
-    // Fallback: Haversine distance + static speeds
-    const dist = getHaversineDistance(from.lat, from.lng, to.lat, to.lng);
-    const speed = AVERAGE_SPEEDS[mode] || AVERAGE_SPEEDS.foot;
-    const duration = dist / speed;
-    return {
-      distance: dist,
-      duration: duration,
-      geometry: {
-        type: 'LineString',
-        coordinates: [
-          [from.lng, from.lat],
-          [to.lng, to.lat],
-        ],
-      },
-    };
   }
 
-  // Double fallback
+  // Fallback: Haversine distance + static speeds
   const dist = getHaversineDistance(from.lat, from.lng, to.lat, to.lng);
-  return { distance: dist, duration: dist / AVERAGE_SPEEDS.foot };
+  const speed = AVERAGE_SPEEDS[mode] || AVERAGE_SPEEDS.foot;
+  const duration = dist / speed;
+  return {
+    distance: dist,
+    duration: duration,
+    geometry: {
+      type: 'LineString',
+      coordinates: [
+        [from.lng, from.lat],
+        [to.lng, to.lat],
+      ],
+    },
+  };
 }
 
-// Fetch weather from Open-Meteo
-export async function getWeatherForecast(lat: number, lng: number, daysCount: number): Promise<WeatherForecast[]> {
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto`;
-  
+// Fetch weather from Open-Meteo. When a startDate is provided the forecast is
+// requested for the actual trip window so forecast[day-1] lines up with the
+// real calendar day rather than "today".
+export async function getWeatherForecast(
+  lat: number,
+  lng: number,
+  daysCount: number,
+  startDate?: string
+): Promise<WeatherForecast[]> {
+  // Anchor the window on the trip start (UTC date arithmetic, no DST drift).
+  const anchor = startDate ? new Date(`${startDate}T00:00:00Z`) : new Date();
+  const startAnchor = isNaN(anchor.getTime()) ? new Date() : anchor;
+  const endAnchor = new Date(startAnchor);
+  endAnchor.setUTCDate(endAnchor.getUTCDate() + Math.max(0, daysCount - 1));
+  const startStr = startAnchor.toISOString().split('T')[0];
+  const endStr = endAnchor.toISOString().split('T')[0];
+
+  let url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto`;
+  if (startDate) {
+    url += `&start_date=${startStr}&end_date=${endStr}`;
+  }
+
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
     if (!res.ok) throw new Error('Open-Meteo offline');
     const data = await res.json();
-    
-    if (data.daily) {
+
+    if (data.daily?.time?.length) {
       return data.daily.time.map((dateStr: string, idx: number) => ({
         date: dateStr,
         rainProbability: (data.daily.precipitation_probability_max?.[idx] ?? 0) / 100,
@@ -124,15 +165,14 @@ export async function getWeatherForecast(lat: number, lng: number, daysCount: nu
       }));
     }
   } catch (e) {
-    console.warn('Weather fetch failed, falling back to clear weather mocks.', e);
+    console.warn('Weather fetch failed, falling back to clear weather mocks.', e instanceof Error ? e.message : e);
   }
 
-  // Fallback default forecast
+  // Fallback default forecast, keyed off the trip start date.
   const forecast: WeatherForecast[] = [];
-  const start = new Date();
   for (let i = 0; i < daysCount; i++) {
-    const d = new Date(start);
-    d.setDate(d.getDate() + i);
+    const d = new Date(startAnchor);
+    d.setUTCDate(d.getUTCDate() + i);
     forecast.push({
       date: d.toISOString().split('T')[0],
       rainProbability: 0.1,
@@ -301,33 +341,40 @@ export class ItineraryOptimizer {
     let currentLocation = startLocation;
     let totalDistance = 0;
 
-    // Convert locked activities list to sorted array
+    // Convert locked activities list to sorted array. Locks are hard checkpoints
+    // that must always be scheduled; we track which we've placed so a lock can
+    // never be silently skipped when the greedy clock jumps past its start.
     const sortedLocks = [...lockedActivities].sort((a, b) => a.startTime - b.startTime);
+    const placedLockPoiIds = new Set<string>();
 
-    // We proceed minute-by-minute or event-by-event
     while (currentTime < constraints.endTime) {
-      // Check if there is an upcoming locked activity
-      const nextLock = sortedLocks.find(l => l.startTime >= currentTime);
-      
-      // If we are currently in or overlapping a locked window, advance time
-      const activeLock = sortedLocks.find(l => currentTime >= l.startTime && currentTime < l.endTime);
-      if (activeLock) {
-        const lockPoi = pois.find(p => p.id === activeLock.poiId);
+      // Earliest lock we have not yet placed.
+      const pendingLock = sortedLocks.find(l => !placedLockPoiIds.has(l.poiId));
+
+      // If we've reached (or overshot) a lock's start, place it now — snapping
+      // to its reserved window — rather than only when currentTime lands inside.
+      if (pendingLock && currentTime >= pendingLock.startTime) {
+        const lockPoi = pois.find(p => p.id === pendingLock.poiId);
         if (lockPoi) {
           const route = await getRoute(currentLocation, lockPoi, constraints.transportMode);
           schedule.push({
             poi: lockPoi,
-            startTime: activeLock.startTime,
-            endTime: activeLock.endTime,
+            startTime: Math.round(pendingLock.startTime),
+            endTime: Math.round(pendingLock.endTime),
             travelTime: route.duration,
-            distance: route.distance
+            distance: route.distance,
           });
           totalDistance += route.distance;
           currentLocation = lockPoi;
         }
-        currentTime = activeLock.endTime;
+        placedLockPoiIds.add(pendingLock.poiId);
+        // Never move the clock backwards if a lock window is in the past.
+        currentTime = Math.max(currentTime, pendingLock.endTime);
         continue;
       }
+
+      // The pending lock (if any) is still in the future and gates candidates.
+      const nextLock = pendingLock;
 
       // Try to find the best candidate activity
       let bestCandidate = null;
@@ -340,7 +387,8 @@ export class ItineraryOptimizer {
 
         const route = await getRoute(currentLocation, item.poi, constraints.transportMode);
         const buffer = Math.max(10, Math.ceil(0.15 * route.duration)); // 15% dynamic buffer, min 10m
-        const tempArrival = currentTime + route.duration + buffer;
+        // Round to whole minutes — the DB columns are INTEGER and the UI shows minutes.
+        const tempArrival = Math.round(currentTime + route.duration + buffer);
         const tempDeparture = tempArrival + item.poi.dwellTimeMinutes;
 
         // Check if fits day boundary
@@ -349,8 +397,13 @@ export class ItineraryOptimizer {
         // Check if overlaps next lock
         if (nextLock && tempDeparture + buffer > nextLock.startTime) continue;
 
-        // Check distance limits
-        if (constraints.transportMode === 'foot' && totalDistance + route.distance > constraints.maxWalkingDistanceMeters) {
+        // Check distance limits (walking has an explicit cap; bike is bounded at
+        // 4x that budget so a day cannot sprawl unbounded; car is left uncapped).
+        const distanceCap =
+          constraints.transportMode === 'foot' ? constraints.maxWalkingDistanceMeters
+          : constraints.transportMode === 'bike' ? constraints.maxWalkingDistanceMeters * 4
+          : Infinity;
+        if (totalDistance + route.distance > distanceCap) {
           continue;
         }
 
@@ -378,16 +431,17 @@ export class ItineraryOptimizer {
         totalDistance += bestRoute.distance;
         currentLocation = bestCandidate;
         currentTime = departureTime;
+      } else if (nextLock && nextLock.startTime > currentTime) {
+        // Nothing else fits before the next lock — jump the clock to it.
+        currentTime = nextLock.startTime;
       } else {
-        // If we can't schedule anything, either advance to the next lock or end the day
-        if (nextLock) {
-          currentTime = nextLock.startTime;
-        } else {
-          break;
-        }
+        break;
       }
     }
 
-    return { activities: schedule, totalDistance };
+    // Keep the schedule in chronological order (locks may be placed out of order).
+    schedule.sort((a, b) => a.startTime - b.startTime);
+
+    return { activities: schedule, totalDistance: Math.round(totalDistance) };
   }
 }
