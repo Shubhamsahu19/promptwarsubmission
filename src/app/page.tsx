@@ -27,18 +27,31 @@ export default function Dashboard() {
   const [isLoading, setIsLoading] = useState(false);
   const [isReplanning, setIsReplanning] = useState(false);
   const [showShareNotification, setShowShareNotification] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Fetch the full plan from database
+  // Fetch the full plan from database. Throws on failure so callers can react.
   const loadPlan = async (id: string) => {
-    try {
-      const res = await fetch(`/api/trip/${id}/plan`);
-      if (!res.ok) throw new Error('Failed to load trip plan');
-      const data = await res.json();
-      setTripPlan(data);
-    } catch (err) {
-      console.error(err);
-    }
+    const res = await fetch(`/api/trip/${id}/plan`);
+    if (!res.ok) throw new Error('Failed to load trip plan');
+    const data = await res.json();
+    setTripPlan(data);
+    setLoadError(null);
   };
+
+  // Restore a shared/refreshed trip from the ?trip= URL param on first load.
+  useEffect(() => {
+    // Read the trip id from the URL on mount. This must happen in an effect
+    // (not a useState initializer) because `window` is unavailable during SSR.
+    const id = new URLSearchParams(window.location.search).get('trip');
+    if (!id) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional one-time hydration from the URL on mount
+    setTripId(id);
+    setActiveDay(1);
+    loadPlan(id).catch((err) => {
+      console.error(err);
+      setLoadError('Could not load that itinerary. The link may be invalid or expired.');
+    });
+  }, []);
 
   // Create new trip
   const handleCreateTrip = async (formData: any) => {
@@ -58,7 +71,9 @@ export default function Dashboard() {
       setTripId(data.tripId);
       await loadPlan(data.tripId);
       setActiveDay(1);
-      
+      // Persist the trip in the URL so a refresh or shared link restores it.
+      window.history.replaceState(null, '', `?trip=${data.tripId}`);
+
       // Trigger confetti on successful trip generation
       confetti({
         particleCount: 80,
@@ -91,6 +106,7 @@ export default function Dashboard() {
       }
     } catch (err) {
       console.error('Error locking slot:', err);
+      setLoadError('Could not update the lock. Please try again.');
     }
   };
 
@@ -131,23 +147,53 @@ export default function Dashboard() {
       }
     } catch (err) {
       console.error(err);
-      alert('Failed to re-plan day. Please check constraints.');
+      setLoadError('Failed to re-plan this day. Please try again.');
     } finally {
       setIsReplanning(false);
     }
   };
 
-  // Copy share link
-  const handleShare = () => {
-    navigator.clipboard.writeText(window.location.href + `?trip=${tripId}`);
-    setShowShareNotification(true);
-    setTimeout(() => setShowShareNotification(false), 3000);
+  // Copy share link (resilient to non-HTTPS / denied clipboard permission)
+  const handleShare = async () => {
+    const shareUrl = `${window.location.origin}${window.location.pathname}?trip=${tripId}`;
+    let copied = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(shareUrl);
+        copied = true;
+      }
+    } catch {
+      copied = false;
+    }
+    if (!copied) {
+      // Fallback for insecure origins / denied permission.
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = shareUrl;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        copied = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch {
+        copied = false;
+      }
+    }
+    if (copied) {
+      setShowShareNotification(true);
+      setTimeout(() => setShowShareNotification(false), 3000);
+    } else {
+      window.prompt('Copy this link to share your itinerary:', shareUrl);
+    }
   };
 
   // Reset to form view
   const handleReset = () => {
     setTripId(null);
     setTripPlan(null);
+    setLoadError(null);
+    window.history.replaceState(null, '', window.location.pathname);
   };
 
   // Extract active day's activities for map display
@@ -201,10 +247,29 @@ export default function Dashboard() {
 
       {/* Main Content Area */}
       <div className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-w-7xl mx-auto w-full h-[calc(100vh-80px)] overflow-hidden">
-        {showShareNotification && (
-          <div className="fixed top-20 right-6 bg-slate-900 border border-emerald-500/30 text-emerald-300 px-4 py-3 rounded-xl shadow-lg z-50 text-xs flex items-center space-x-2 animate-fade-in">
-            <Sparkles className="w-4 h-4 text-emerald-400" />
-            <span>Link copied to clipboard! Share it with friends.</span>
+        <div aria-live="polite">
+          {showShareNotification && (
+            <div className="fixed top-20 right-6 bg-slate-900 border border-emerald-500/30 text-emerald-300 px-4 py-3 rounded-xl shadow-lg z-50 text-xs flex items-center space-x-2 animate-fade-in">
+              <Sparkles className="w-4 h-4 text-emerald-400" />
+              <span>Link copied to clipboard! Share it with friends.</span>
+            </div>
+          )}
+        </div>
+
+        {loadError && (
+          <div
+            role="alert"
+            className="fixed top-20 right-6 bg-slate-900 border border-rose-500/30 text-rose-300 px-4 py-3 rounded-xl shadow-lg z-50 text-xs flex items-center space-x-2 max-w-xs"
+          >
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{loadError}</span>
+            <button
+              onClick={() => setLoadError(null)}
+              aria-label="Dismiss error"
+              className="ml-2 text-rose-400 hover:text-rose-200 font-bold"
+            >
+              ×
+            </button>
           </div>
         )}
 

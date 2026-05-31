@@ -3,6 +3,16 @@ import { db } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
+// Tolerate malformed/legacy JSON in DB columns instead of 500-ing the request.
+function safeParse<T>(raw: string | null | undefined, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const resolvedParams = await params;
@@ -17,12 +27,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     // 2. Fetch Constraints
     const constraints = db.prepare(`SELECT * FROM trip_constraints WHERE trip_id = ?`).get(tripId) as any;
     if (constraints) {
-      constraints.preferred_tags = JSON.parse(constraints.preferred_tags);
+      constraints.preferred_tags = safeParse<string[]>(constraints.preferred_tags, []);
     }
 
     // 3. Fetch latest Itinerary
     const itinerary = db.prepare(`
-      SELECT * FROM itineraries WHERE trip_id = ? ORDER BY version DESC LIMIT 1
+      SELECT * FROM itineraries WHERE trip_id = ? ORDER BY version DESC, created_at DESC LIMIT 1
     `).get(tripId) as any;
 
     if (!itinerary) {
@@ -60,17 +70,17 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
           lat: act.lat,
           lng: act.lng,
           popularity: act.popularity,
-          tags: JSON.parse(act.tags),
+          tags: safeParse<string[]>(act.tags, []),
           isOutdoor: act.is_outdoor === 1,
           dwellTimeMinutes: act.dwell_time_minutes,
-          openingHours: JSON.parse(act.opening_hours),
+          openingHours: safeParse<{ open: number; close: number }[]>(act.opening_hours, []),
         }
       }));
 
       days.push({
         id: dp.id,
         dayNumber: dp.day_number,
-        weatherSummary: JSON.parse(dp.weather_summary || '{}'),
+        weatherSummary: safeParse<Record<string, unknown>>(dp.weather_summary, {}),
         totalDistanceMeters: dp.total_distance_meters,
         activities: parsedActivities
       });
@@ -91,6 +101,6 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     });
   } catch (error: any) {
     console.error('Error fetching trip plan:', error);
-    return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
